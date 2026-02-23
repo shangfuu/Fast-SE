@@ -1,18 +1,14 @@
 # Environment Settings
-# These settings specify the hardware and distributed setup for the model training.
-# Adjust `num_gpus` and `dist_config` according to your distributed training environment.
+# These settings specify the hardware setup for the model training.
+# num_gpus is for reference only - Accelerate will auto-detect available GPUs.
 env_setting:
-  num_gpus: 2  # Number of GPUs. Now we don't support CPU mode. 
+  num_gpus: 2  # Number of GPUs (for reference only, Accelerate auto-detects). CPU mode not supported.
   num_workers: 20  # Number of worker threads for data loading.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
   stdout_interval: 10
   checkpoint_interval: 1000  # save model to ckpt every N steps
   validation_interval: 1000
   summary_interval: 100
-  dist_cfg:
-    dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:29477  # URL for initializing distributed training.
-    world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
 data_cfg:

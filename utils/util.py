@@ -3,7 +3,6 @@ import torch
 import os
 import shutil
 import glob
-from torch.distributed import init_process_group
 
 def load_config(config_path):
     """Load configuration from a YAML file."""
@@ -17,22 +16,13 @@ def initialize_seed(seed):
         torch.cuda.manual_seed(seed)
 
 def print_gpu_info(num_gpus, cfg):
-    """Print information about available GPUs and batch size per GPU."""
+    """Print information about available GPUs."""
     for i in range(num_gpus):
         gpu_name = torch.cuda.get_device_name(i)
         print(f"GPU {i}: {gpu_name}")
-        print('Batch size per GPU:', int(cfg['training_cfg']['batch_size'] / num_gpus))
+    print('Total batch size:', cfg['training_cfg']['batch_size'])
 
-def initialize_process_group(cfg, rank):
-    """Initialize the process group for distributed training."""
-    init_process_group(
-        backend=cfg['env_setting']['dist_cfg']['dist_backend'],
-        init_method=cfg['env_setting']['dist_cfg']['dist_url'],
-        world_size=cfg['env_setting']['dist_cfg']['world_size'] * cfg['env_setting']['num_gpus'],
-        rank=rank
-    )
-
-def log_model_info(rank, model, exp_path):
+def log_model_info(model, exp_path):
     """Log model information and create necessary directories."""
     print(model)
     num_params = sum(p.numel() for p in model.parameters())

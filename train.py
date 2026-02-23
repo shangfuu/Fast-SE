@@ -9,9 +9,8 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DistributedSampler, DataLoader
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader
+from accelerate import Accelerator
 
 from dataloaders.dataloader_vctk import VCTKDemandDataset
 from models.stfts import mag_phase_stft, mag_phase_istft
@@ -20,8 +19,8 @@ from models.loss import pesq_score, phase_losses
 from models.discriminator import MetricDiscriminator, batch_pesq
 from utils.util import (
     load_ckpts, load_optimizer_states, save_checkpoint,
-    build_env, load_config, initialize_seed, 
-    print_gpu_info, log_model_info, initialize_process_group,
+    build_env, load_config, initialize_seed,
+    print_gpu_info, log_model_info,
 )
 
 torch.backends.cudnn.benchmark = True
@@ -72,54 +71,41 @@ def create_dataset(cfg, train=True, split=True, device='cuda:0'):
 
 def create_dataloader(dataset, cfg, train=True):
     """Create dataloader based on dataset and configuration."""
-    if cfg['env_setting']['num_gpus'] > 1:
-        sampler = DistributedSampler(dataset)
-        sampler.set_epoch(cfg['training_cfg']['training_epochs'])
-        batch_size = (cfg['training_cfg']['batch_size'] // cfg['env_setting']['num_gpus']) if train else 1
-    else:
-        sampler = None
-        batch_size = cfg['training_cfg']['batch_size'] if train else 1
+    batch_size = cfg['training_cfg']['batch_size'] if train else 1
     num_workers = cfg['env_setting']['num_workers'] if train else 1
 
     return DataLoader(
         dataset,
         num_workers=num_workers,
-        shuffle=(sampler is None) and train,
-        sampler=sampler,
+        shuffle=train,
         batch_size=batch_size,
         pin_memory=True,
         drop_last=True if train else False
     )
 
 
-def train(rank, args, cfg):
-    num_gpus = cfg['env_setting']['num_gpus']
+def train(args, cfg):
+    # TODO: Add mixed precision support with Accelerator(mixed_precision='fp16') or 'bf16'
+    accelerator = Accelerator()
+
     n_fft, hop_size, win_size = cfg['stft_cfg']['n_fft'], cfg['stft_cfg']['hop_size'], cfg['stft_cfg']['win_size']
     compress_factor = cfg['model_cfg']['compress_factor']
-    batch_size = cfg['training_cfg']['batch_size'] // cfg['env_setting']['num_gpus']
-    if num_gpus >= 1:
-        initialize_process_group(cfg, rank)
-        device = torch.device('cuda:{:d}'.format(rank))
-    else:
-        raise RuntimeError("Mamba needs GPU acceleration")
+    batch_size = cfg['training_cfg']['batch_size']
+    device = accelerator.device
 
-    generator = SEMamba(cfg).to(device)
-    discriminator = MetricDiscriminator().to(device)
+    generator = SEMamba(cfg)
+    discriminator = MetricDiscriminator()
 
-    if rank == 0:
-        log_model_info(rank, generator, args.exp_path)
+    if accelerator.is_main_process:
+        log_model_info(generator, args.exp_path)
 
     state_dict_g, state_dict_do, steps, last_epoch = load_ckpts(args, device)
     if state_dict_g is not None:
         generator.load_state_dict(state_dict_g['generator'], strict=False)
         discriminator.load_state_dict(state_dict_do['discriminator'], strict=False)
 
-    if num_gpus > 1 and torch.cuda.is_available():
-        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
-        discriminator = DistributedDataParallel(discriminator, device_ids=[rank]).to(device)
-
     if cfg['training_cfg'].get('use_pretrainedD', False):
-        discriminator.load_state_dict( torch.load('ckpts/pretrained_discriminator.pth') )
+        discriminator.load_state_dict( torch.load('ckpts/pretrained_discriminator.pth', map_location=device) )
         print("Loaded pretrained weight from ckpts/pretrained_discriminator.pth.")
 
     # Create optimizer and schedulers
@@ -132,8 +118,13 @@ def train(rank, args, cfg):
     trainset = create_dataset(cfg, train=True, split=True, device=device)
     train_loader = create_dataloader(trainset, cfg, train=True)
 
-    # Create validset and validation_loader if rank is 0
-    if rank == 0:
+    # Prepare models, optimizers, and dataloaders with Accelerate
+    generator, discriminator, optim_g, optim_d, train_loader, scheduler_g, scheduler_d = accelerator.prepare(
+        generator, discriminator, optim_g, optim_d, train_loader, scheduler_g, scheduler_d
+    )
+
+    # Create validset and validation_loader if main process
+    if accelerator.is_main_process:
         validset = create_dataset(cfg, train=False, split=False, device=device)
         validation_loader = create_dataloader(validset, cfg, train=False)
         sw = SummaryWriter(os.path.join(args.exp_path, 'logs'))
@@ -143,12 +134,12 @@ def train(rank, args, cfg):
 
     best_pesq, best_pesq_step = 0.0, 0
     for epoch in range(max(0, last_epoch), cfg['training_cfg']['training_epochs']):
-        if rank == 0:
+        if accelerator.is_main_process:
             start = time.time()
             print("Epoch: {}".format(epoch+1))
 
         for i, batch in enumerate(train_loader):
-            if rank == 0:
+            if accelerator.is_main_process:
                 start_b = time.time()
             clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
             clean_audio = torch.autograd.Variable(clean_audio.to(device, non_blocking=True))
@@ -178,11 +169,11 @@ def train(rank, args, cfg):
                 loss_disc_g = 0
             
             loss_disc_all = loss_disc_r + loss_disc_g
-            
-            loss_disc_all.backward()
+
+            accelerator.backward(loss_disc_all)
             optim_d.step()
             # ------------------------------------------------------- #
-            
+
             # Generator
             # ------------------------------------------------------- #
             optim_g.zero_grad()
@@ -209,15 +200,15 @@ def train(rank, args, cfg):
                 loss_mag * cfg['training_cfg']['loss']['magnitude'] +
                 loss_pha * cfg['training_cfg']['loss']['phase'] +
                 loss_com * cfg['training_cfg']['loss']['complex'] +
-                loss_time * cfg['training_cfg']['loss']['time'] + 
+                loss_time * cfg['training_cfg']['loss']['time'] +
                 loss_con * cfg['training_cfg']['loss']['consistancy']
             )
 
-            loss_gen_all.backward()
+            accelerator.backward(loss_gen_all)
             optim_g.step()
             # ------------------------------------------------------- #
 
-            if rank == 0:
+            if accelerator.is_main_process:
                 # STDOUT logging
                 if steps % cfg['env_setting']['stdout_interval'] == 0:
                     with torch.no_grad():
@@ -242,14 +233,14 @@ def train(rank, args, cfg):
                     save_checkpoint(
                         exp_name,
                         {
-                            'generator': (generator.module if num_gpus > 1 else generator).state_dict()
+                            'generator': accelerator.unwrap_model(generator).state_dict()
                         }
                     )
                     exp_name = f"{args.exp_path}/do_{steps:08d}.pth"
                     save_checkpoint(
                         exp_name,
                         {
-                            'discriminator': (discriminator.module if num_gpus > 1 else discriminator).state_dict(),
+                            'discriminator': accelerator.unwrap_model(discriminator).state_dict(),
                             'optim_g': optim_g.state_dict(),
                             'optim_d': optim_d.state_dict(),
                             'steps': steps,
@@ -322,8 +313,8 @@ def train(rank, args, cfg):
 
         scheduler_g.step()
         scheduler_d.step()
-        
-        if rank == 0:
+
+        if accelerator.is_main_process:
             print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
 
 # Reference: https://github.com/yxlu-0102/MP-SENet/blob/main/train.py
@@ -336,18 +327,6 @@ def main():
 
     cfg = load_config(args.config)
     seed = cfg['env_setting']['seed']
-    num_gpus = cfg['env_setting']['num_gpus']
-    available_gpus = torch.cuda.device_count()
-
-    if num_gpus > available_gpus:
-        warnings.warn(
-            f"Warning: The actual number of available GPUs ({available_gpus}) is less than the .yaml config ({num_gpus}). Auto reset to num_gpu = {available_gpus}",
-            UserWarning
-        )
-        cfg['env_setting']['num_gpus'] = available_gpus
-        num_gpus = available_gpus
-        time.sleep(5)
-        
 
     initialize_seed(seed)
     args.exp_path = os.path.join(args.exp_folder, args.exp_name)
@@ -358,12 +337,10 @@ def main():
         print(f"Number of GPUs available: {num_available_gpus}")
         print_gpu_info(num_available_gpus, cfg)
     else:
-        print("CUDA is not available.")
+        print("CUDA is not available. Accelerate will handle device placement.")
 
-    if num_gpus > 1:
-        mp.spawn(train, nprocs=num_gpus, args=(args, cfg))
-    else:
-        train(0, args, cfg)
+    # Accelerate handles multi-GPU setup automatically
+    train(args, cfg)
 
 if __name__ == '__main__':
     main()

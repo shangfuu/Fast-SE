@@ -4,6 +4,7 @@ import argparse
 import json
 import torch
 import librosa
+from accelerate import Accelerator
 from models.stfts import mag_phase_stft, mag_phase_istft
 from models.generator import SEMamba
 from models.pcs400 import cal_pcs
@@ -11,12 +12,9 @@ import soundfile as sf
 
 from utils.util import (
     load_ckpts, load_optimizer_states, save_checkpoint,
-    build_env, load_config, initialize_seed, 
-    print_gpu_info, log_model_info, initialize_process_group,
+    build_env, load_config, initialize_seed,
+    print_gpu_info, log_model_info,
 )
-
-h = None
-device = None
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -28,15 +26,22 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
-def inference(args, device):
+def inference(args):
+    # Initialize Accelerator for automatic device handling
+    accelerator = Accelerator()
+    device = accelerator.device
+
     cfg = load_config(args.config)
     n_fft, hop_size, win_size = cfg['stft_cfg']['n_fft'], cfg['stft_cfg']['hop_size'], cfg['stft_cfg']['win_size']
     compress_factor = cfg['model_cfg']['compress_factor']
     sampling_rate = cfg['stft_cfg']['sampling_rate']
 
-    model = SEMamba(cfg).to(device)
+    model = SEMamba(cfg)
     state_dict = torch.load(args.checkpoint_file, map_location=device)
     model.load_state_dict(state_dict['generator'])
+
+    # Prepare model with Accelerate
+    model = accelerator.prepare(model)
 
     os.makedirs(args.output_folder, exist_ok=True)
 
@@ -84,15 +89,8 @@ def main():
     parser.add_argument('--post_processing_PCS', type=str2bool, default=False)
     args = parser.parse_args()
 
-    global device
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-    else:
-        #device = torch.device('cpu')
-        raise RuntimeError("Currently, CPU mode is not supported.")
-        
-
-    inference(args, device)
+    # Accelerate handles device placement automatically
+    inference(args)
 
 
 if __name__ == '__main__':
